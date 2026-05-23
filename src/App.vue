@@ -16,8 +16,10 @@ import {
 } from "lucide-vue-next";
 
 const MiB = 1024 * 1024;
+const GiB = 1024 * MiB;
 const API_BASE = (import.meta.env.VITE_API_BASE || "").replace(/\/$/, "");
 const DEFAULT_FLOW_SECONDS = 12;
+const GAUGE_THRESHOLDS = [100, 250, 500, 1000, 2500, 5000, 10000, 20000];
 
 const config = reactive({
   serviceName: "ESA Edge Speed",
@@ -26,21 +28,23 @@ const config = reactive({
   maxUploadBytes: 64 * MiB,
   defaultSingleBytes: 64 * MiB,
   defaultFlowSeconds: DEFAULT_FLOW_SECONDS,
-  maxParallel: 8,
+  maxParallel: 64,
   authRequired: false,
   edge: {}
 });
 
 const state = reactive({
-  mode: "single",
+  mode: "flow",
   phase: "idle",
   status: "待机",
   error: "",
   singleSizeMiB: 64,
   uploadSizeMiB: 8,
   flowSeconds: DEFAULT_FLOW_SECONDS,
-  parallel: 4,
-  includeUpload: false
+  flowLimitGiB: 0,
+  parallel: 16,
+  includeUpload: false,
+  gaugeMax: 100
 });
 
 const storedToken =
@@ -61,6 +65,7 @@ const metrics = reactive({
 });
 
 const rateSamples = ref([]);
+const threadStats = ref([]);
 const activeControllers = new Set();
 let runId = 0;
 
@@ -74,35 +79,43 @@ const isRunning = computed(() => state.phase === "running");
 const apiOriginLabel = computed(() => API_BASE || window.location.origin);
 const selectedBytes = computed(() => clampBytes(state.singleSizeMiB * MiB, MiB, config.maxDownloadBytes));
 const uploadBytes = computed(() => clampBytes(state.uploadSizeMiB * MiB, MiB, config.maxUploadBytes));
+const flowLimitBytes = computed(() => Math.max(0, Number(state.flowLimitGiB || 0)) * GiB);
+const hasFlowTimeLimit = computed(() => Number(state.flowSeconds || 0) > 0);
+const hasFlowByteLimit = computed(() => flowLimitBytes.value > 0);
+const totalStopLabel = computed(() => {
+  const parts = [];
+  if (hasFlowTimeLimit.value) parts.push(`${Number(state.flowSeconds)} s`);
+  if (hasFlowByteLimit.value) parts.push(formatBytes(flowLimitBytes.value));
+  return parts.length ? parts.join(" / ") : "manual stop";
+});
 const resultMbps = computed(() => {
   if (metrics.liveMbps > 0) return metrics.liveMbps;
   if (metrics.downloadMbps > 0) return metrics.downloadMbps;
   return 0;
 });
 const gaugePercent = computed(() => {
-  const speed = resultMbps.value;
-  const scale = speed < 100 ? 100 : speed < 500 ? 500 : speed < 1000 ? 1000 : speed < 2500 ? 2500 : 5000;
-  return Math.min(100, Math.round((speed / scale) * 100));
+  const max = Math.max(state.gaugeMax, 100);
+  return Math.min(100, Math.max(0, (resultMbps.value / max) * 100));
 });
 const gaugeStyle = computed(() => ({
   "--meter": `${gaugePercent.value}%`
 }));
 const chartBars = computed(() => {
-  const tail = rateSamples.value.slice(-28);
+  const tail = rateSamples.value.slice(-44);
   const max = Math.max(...tail, 1);
   return tail.map((value) => ({
     value,
-    height: `${Math.max(10, (value / max) * 100)}%`
+    height: `${Math.max(8, (value / max) * 100)}%`
   }));
 });
 const edgeLabel = computed(() => {
   const edge = config.edge || {};
-  return edge.pop || edge.region || edge.city || "ESA Edge";
+  return edge.pop || edge.region || edge.city || edge.ip || "ESA Edge";
 });
 const endpointRows = computed(() => [
   { method: "GET", path: "/api/ping" },
   { method: "GET", path: "/api/download?bytes=67108864" },
-  { method: "GET", path: "/api/flow?bytes=536870912" },
+  { method: "GET", path: "/api/flow?bytes=1073741824" },
   { method: "POST", path: "/api/upload" }
 ]);
 
@@ -111,6 +124,12 @@ const uploadOptions = [2, 4, 8, 16, 32, 64];
 
 function clampBytes(value, min, max) {
   return Math.min(Math.max(Math.round(value), min), max);
+}
+
+function clampNumber(value, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return min;
+  return Math.min(Math.max(parsed, min), max);
 }
 
 function formatMbps(value) {
@@ -127,7 +146,7 @@ function speedUnit(value) {
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
-  if (bytes >= 1024 * MiB) return `${(bytes / (1024 * MiB)).toFixed(2)} GiB`;
+  if (bytes >= GiB) return `${(bytes / GiB).toFixed(bytes >= 10 * GiB ? 1 : 2)} GiB`;
   if (bytes >= MiB) return `${(bytes / MiB).toFixed(1)} MiB`;
   return `${(bytes / 1024).toFixed(0)} KiB`;
 }
@@ -135,7 +154,11 @@ function formatBytes(bytes) {
 function formatDuration(ms) {
   if (!ms) return "0.0 s";
   if (ms < 1000) return `${Math.max(1, Math.round(ms))} ms`;
-  return `${(ms / 1000).toFixed(1)} s`;
+  const seconds = ms / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)} s`;
+  const minutes = Math.floor(seconds / 60);
+  const remain = Math.floor(seconds % 60);
+  return `${minutes}m ${String(remain).padStart(2, "0")}s`;
 }
 
 function bytesToMbps(bytes, ms) {
@@ -196,10 +219,26 @@ async function loadConfig() {
     Object.assign(config, data);
     state.singleSizeMiB = Math.min(Math.round(config.defaultSingleBytes / MiB), Math.round(config.maxDownloadBytes / MiB));
     state.flowSeconds = config.defaultFlowSeconds || DEFAULT_FLOW_SECONDS;
-    state.parallel = Math.min(state.parallel, config.maxParallel || 8);
+    state.parallel = Math.min(Math.max(state.parallel, 1), config.maxParallel || 64);
+    resetThreadStats();
   } catch (error) {
     state.error = `配置读取失败：${error.message}`;
   }
+}
+
+function resetThreadStats() {
+  const count = Math.min(Math.max(Math.round(state.parallel || 1), 1), config.maxParallel || 64);
+  threadStats.value = Array.from({ length: count }, (_, index) => ({
+    index,
+    mbps: 0,
+    bytes: 0,
+    status: "ready"
+  }));
+}
+
+function updateThreadStat(index, patch) {
+  const current = threadStats.value[index] || { index, mbps: 0, bytes: 0, status: "ready" };
+  threadStats.value[index] = { ...current, ...patch };
 }
 
 function resetMetrics() {
@@ -213,7 +252,20 @@ function resetMetrics() {
   metrics.uploadedBytes = 0;
   metrics.progress = 0;
   metrics.elapsedMs = 0;
+  state.gaugeMax = 100;
   rateSamples.value = [];
+  resetThreadStats();
+}
+
+function appendRateSample(value) {
+  rateSamples.value = [...rateSamples.value.slice(-80), value];
+}
+
+function updateGaugeScale(value) {
+  if (!Number.isFinite(value) || value <= 0) return;
+  if (value <= state.gaugeMax * 0.92) return;
+  const next = GAUGE_THRESHOLDS.find((item) => item >= value * 1.18) || GAUGE_THRESHOLDS.at(-1);
+  state.gaugeMax = Math.max(state.gaugeMax, next);
 }
 
 function cancelRun() {
@@ -233,6 +285,20 @@ function ensureActive(id) {
   }
 }
 
+function computeProgress(started, totalBytes) {
+  const timeLimitMs = hasFlowTimeLimit.value ? Number(state.flowSeconds) * 1000 : 0;
+  const timeProgress = timeLimitMs > 0 ? (performance.now() - started) / timeLimitMs : 0;
+  const byteProgress = hasFlowByteLimit.value ? totalBytes / flowLimitBytes.value : 0;
+  if (!timeLimitMs && !hasFlowByteLimit.value) return 0;
+  return Math.min(100, Math.round(Math.max(timeProgress, byteProgress) * 100));
+}
+
+function shouldStopFlow(started, totalBytes) {
+  if (hasFlowTimeLimit.value && performance.now() - started >= Number(state.flowSeconds) * 1000) return true;
+  if (hasFlowByteLimit.value && totalBytes >= flowLimitBytes.value) return true;
+  return false;
+}
+
 async function runLatency(id) {
   state.status = "测量延迟";
   const samples = [];
@@ -250,37 +316,36 @@ async function runLatency(id) {
     } finally {
       releaseController(controller);
     }
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await new Promise((resolve) => setTimeout(resolve, 60));
   }
 
   samples.sort((a, b) => a - b);
-  const trimmed = samples.slice(1, -1);
-  const usable = trimmed.length ? trimmed : samples;
-  const avg = usable.reduce((sum, item) => sum + item, 0) / usable.length;
+  const trimmed = samples.length > 3 ? samples.slice(1, -1) : samples;
+  const avg = trimmed.reduce((sum, item) => sum + item, 0) / trimmed.length;
   const jitter =
-    usable.length > 1
-      ? usable.slice(1).reduce((sum, item, index) => sum + Math.abs(item - usable[index]), 0) /
-        (usable.length - 1)
+    trimmed.length > 1
+      ? trimmed.slice(1).reduce((sum, item, index) => sum + Math.abs(item - trimmed[index]), 0) /
+        (trimmed.length - 1)
       : 0;
 
   metrics.latencyMs = avg;
   metrics.jitterMs = jitter;
 }
 
-async function readDownload(endpoint, bytes, id, onChunk) {
+async function readDownload(path, bytes, id, onChunk) {
   const controller = makeController();
   const started = performance.now();
   let received = 0;
 
   try {
-    const response = await fetchApi(`${endpoint}?bytes=${bytes}&r=${cacheBust()}`, {
+    const response = await fetchApi(`${path}?bytes=${bytes}&r=${cacheBust()}`, {
       signal: controller.signal
     });
     const reader = response.body?.getReader();
     if (!reader) {
       const buffer = await response.arrayBuffer();
       received = buffer.byteLength;
-      onChunk?.(received, performance.now() - started);
+      onChunk?.(received, performance.now() - started, received);
     } else {
       while (true) {
         ensureActive(id);
@@ -303,48 +368,75 @@ async function readDownload(endpoint, bytes, id, onChunk) {
 async function runSingleDownload(id) {
   state.status = "单次下载";
   const bytes = selectedBytes.value;
+  let lastPaint = 0;
   const result = await readDownload("/api/download", bytes, id, (received, elapsed) => {
+    const now = performance.now();
+    if (now - lastPaint < 90 && received < bytes) return;
     metrics.downloadedBytes = received;
     metrics.elapsedMs = elapsed;
     metrics.progress = Math.min(100, Math.round((received / bytes) * 100));
     metrics.liveMbps = bytesToMbps(received, elapsed);
+    updateGaugeScale(metrics.liveMbps);
+    lastPaint = now;
   });
 
   metrics.downloadMbps = bytesToMbps(result.bytes, result.ms);
   metrics.liveMbps = metrics.downloadMbps;
   metrics.peakMbps = Math.max(metrics.peakMbps, metrics.downloadMbps);
-  rateSamples.value.push(metrics.downloadMbps);
+  updateGaugeScale(metrics.downloadMbps);
+  appendRateSample(metrics.downloadMbps);
 }
 
 async function runFlowDownload(id) {
   state.status = "持续打流";
-  const durationMs = clampBytes(state.flowSeconds, 3, 120) * 1000;
-  const parallel = Math.min(Math.max(state.parallel, 1), config.maxParallel || 8);
-  const deadline = performance.now() + durationMs;
-  const flowBytes = Math.min(config.maxFlowBytes, Math.max(config.maxDownloadBytes, 64 * MiB));
+  const parallel = Math.min(Math.max(Math.round(state.parallel || 1), 1), config.maxParallel || 64);
+  const flowBytes = Math.min(config.maxFlowBytes, Math.max(config.maxDownloadBytes, 256 * MiB));
+  const started = performance.now();
   let total = 0;
   let lastBytes = 0;
   let lastTick = performance.now();
+  const threadBytes = new Array(parallel).fill(0);
+  const threadLastBytes = new Array(parallel).fill(0);
 
   const sampleTimer = setInterval(() => {
     const now = performance.now();
     const deltaBytes = total - lastBytes;
     const deltaMs = Math.max(now - lastTick, 1);
-    metrics.liveMbps = bytesToMbps(deltaBytes, deltaMs);
-    metrics.peakMbps = Math.max(metrics.peakMbps, metrics.liveMbps);
-    metrics.elapsedMs = Math.min(durationMs, now - (deadline - durationMs));
-    metrics.progress = Math.min(100, Math.round((metrics.elapsedMs / durationMs) * 100));
-    rateSamples.value.push(metrics.liveMbps);
-    if (rateSamples.value.length > 80) rateSamples.value = rateSamples.value.slice(-80);
+    const live = bytesToMbps(deltaBytes, deltaMs);
+
+    metrics.liveMbps = live;
+    metrics.peakMbps = Math.max(metrics.peakMbps, live);
+    metrics.downloadedBytes = total;
+    metrics.elapsedMs = now - started;
+    metrics.progress = computeProgress(started, total);
+    updateGaugeScale(live);
+    appendRateSample(live);
+
+    for (let index = 0; index < parallel; index += 1) {
+      const current = threadBytes[index] || 0;
+      const previous = threadLastBytes[index] || 0;
+      updateThreadStat(index, {
+        status: "active",
+        bytes: current,
+        mbps: bytesToMbps(current - previous, deltaMs)
+      });
+      threadLastBytes[index] = current;
+    }
+
     lastBytes = total;
     lastTick = now;
-  }, 500);
+  }, 300);
 
   async function worker(index) {
-    while (performance.now() < deadline) {
+    while (!shouldStopFlow(started, total)) {
       ensureActive(id);
       const controller = makeController();
-      const timeout = setTimeout(() => controller.abort(), Math.max(20, deadline - performance.now()));
+      let timeout = null;
+      if (hasFlowTimeLimit.value) {
+        const remainingMs = Number(state.flowSeconds) * 1000 - (performance.now() - started);
+        timeout = setTimeout(() => controller.abort(), Math.max(30, remainingMs));
+      }
+
       try {
         const response = await fetchApi(`/api/flow?bytes=${flowBytes}&stream=${index}&r=${cacheBust()}`, {
           signal: controller.signal
@@ -353,19 +445,26 @@ async function runFlowDownload(id) {
         if (!reader) {
           const buffer = await response.arrayBuffer();
           total += buffer.byteLength;
+          threadBytes[index] += buffer.byteLength;
           continue;
         }
-        while (performance.now() < deadline) {
+
+        while (!shouldStopFlow(started, total)) {
           ensureActive(id);
           const { value, done } = await reader.read();
           if (done) break;
           total += value.byteLength;
-          metrics.downloadedBytes = total;
+          threadBytes[index] += value.byteLength;
         }
+
+        try {
+          await reader.cancel();
+        } catch {}
       } catch (error) {
-        if (performance.now() < deadline - 50 && !controller.signal.aborted) throw error;
+        if (controller.signal.aborted || shouldStopFlow(started, total)) return;
+        throw error;
       } finally {
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         releaseController(controller);
       }
     }
@@ -378,11 +477,20 @@ async function runFlowDownload(id) {
   }
 
   metrics.downloadedBytes = total;
-  metrics.elapsedMs = durationMs;
-  metrics.progress = 100;
-  metrics.downloadMbps = bytesToMbps(total, durationMs);
+  metrics.elapsedMs = performance.now() - started;
+  metrics.progress = hasFlowTimeLimit.value || hasFlowByteLimit.value ? 100 : 0;
+  metrics.downloadMbps = bytesToMbps(total, metrics.elapsedMs);
   metrics.liveMbps = metrics.downloadMbps;
   metrics.peakMbps = Math.max(metrics.peakMbps, metrics.downloadMbps);
+  updateGaugeScale(metrics.downloadMbps);
+
+  for (let index = 0; index < parallel; index += 1) {
+    updateThreadStat(index, {
+      status: "active",
+      bytes: threadBytes[index] || 0,
+      mbps: bytesToMbps(threadBytes[index] || 0, metrics.elapsedMs)
+    });
+  }
 }
 
 function makeUploadBlob(bytes) {
@@ -433,6 +541,9 @@ async function runTest() {
   if (isRunning.value) return;
   runId += 1;
   const id = runId;
+  state.parallel = Math.min(Math.max(Math.round(state.parallel || 1), 1), config.maxParallel || 64);
+  state.flowSeconds = Math.max(0, Number(state.flowSeconds || 0));
+  state.flowLimitGiB = Math.max(0, Number(state.flowLimitGiB || 0));
   resetMetrics();
   state.error = "";
   state.phase = "running";
@@ -471,7 +582,7 @@ onMounted(loadConfig);
     <header class="topbar">
       <div class="brand-lockup">
         <div class="brand-mark" aria-hidden="true">
-          <Gauge :size="22" :stroke-width="1.8" />
+          <Gauge :size="22" :stroke-width="1.7" />
         </div>
         <div>
           <p class="eyebrow">{{ edgeLabel }}</p>
@@ -490,6 +601,27 @@ onMounted(loadConfig);
       </div>
     </header>
 
+    <section class="hero-band">
+      <div>
+        <span class="section-tag">EDGE MEASUREMENT</span>
+        <h2>高并发单节点打流面板</h2>
+      </div>
+      <div class="hero-metrics">
+        <div>
+          <span>threads</span>
+          <strong>{{ state.parallel }}</strong>
+        </div>
+        <div>
+          <span>stop</span>
+          <strong>{{ totalStopLabel }}</strong>
+        </div>
+        <div>
+          <span>scale</span>
+          <strong>{{ state.gaugeMax >= 1000 ? `${state.gaugeMax / 1000}G` : `${state.gaugeMax}M` }}</strong>
+        </div>
+      </div>
+    </section>
+
     <section class="workbench">
       <aside class="panel controls-panel">
         <div class="section-title">
@@ -500,11 +632,11 @@ onMounted(loadConfig);
         <div class="segmented" role="tablist" aria-label="测速模式">
           <button type="button" :class="{ active: state.mode === 'single' }" @click="state.mode = 'single'">
             <Download :size="16" :stroke-width="2" />
-            <span>单次测速</span>
+            <span>单次</span>
           </button>
           <button type="button" :class="{ active: state.mode === 'flow' }" @click="state.mode = 'flow'">
             <Radio :size="16" :stroke-width="2" />
-            <span>持续打流</span>
+            <span>打流</span>
           </button>
         </div>
 
@@ -518,16 +650,22 @@ onMounted(loadConfig);
             </select>
           </label>
 
-          <label v-if="state.mode === 'flow'" class="field">
+          <label v-if="state.mode === 'flow'" class="field compact-field">
             <span>打流时长</span>
-            <input v-model.number="state.flowSeconds" type="range" min="3" max="60" step="1" />
-            <strong>{{ state.flowSeconds }} s</strong>
+            <input v-model.number="state.flowSeconds" type="number" min="0" step="1" inputmode="numeric" />
+            <strong>{{ Number(state.flowSeconds || 0) === 0 ? "不限" : `${state.flowSeconds} s` }}</strong>
+          </label>
+
+          <label v-if="state.mode === 'flow'" class="field compact-field">
+            <span>流量上限</span>
+            <input v-model.number="state.flowLimitGiB" type="number" min="0" step="0.1" inputmode="decimal" />
+            <strong>{{ Number(state.flowLimitGiB || 0) === 0 ? "不限" : `${state.flowLimitGiB} GiB` }}</strong>
           </label>
 
           <label v-if="state.mode === 'flow'" class="field">
-            <span>并发连接</span>
+            <span>线程数</span>
             <input v-model.number="state.parallel" type="range" min="1" :max="config.maxParallel" step="1" />
-            <strong>{{ state.parallel }}</strong>
+            <strong>{{ state.parallel }} / {{ config.maxParallel }}</strong>
           </label>
 
           <label class="check-row">
@@ -551,7 +689,7 @@ onMounted(loadConfig);
 
           <label class="field">
             <span>访问令牌</span>
-            <input v-model="token" type="password" autocomplete="off" placeholder="可选" />
+            <input v-model="token" type="password" autocomplete="off" placeholder="X-Speedtest-Token" />
           </label>
         </div>
 
@@ -570,11 +708,17 @@ onMounted(loadConfig);
 
       <section class="meter-panel">
         <div class="meter-grid">
-          <div class="meter" :style="gaugeStyle">
-            <div class="meter-face">
-              <span class="meter-label">当前下载</span>
-              <strong>{{ formatMbps(resultMbps) }}</strong>
-              <small>{{ speedUnit(resultMbps) }}</small>
+          <div class="meter-wrap">
+            <div class="meter" :style="gaugeStyle">
+              <div class="meter-face">
+                <span class="meter-label">当前下载</span>
+                <strong>{{ formatMbps(resultMbps) }}</strong>
+                <small>{{ speedUnit(resultMbps) }}</small>
+              </div>
+            </div>
+            <div class="scale-row">
+              <span>0</span>
+              <span>{{ state.gaugeMax >= 1000 ? `${state.gaugeMax / 1000} Gbps` : `${state.gaugeMax} Mbps` }}</span>
             </div>
           </div>
 
@@ -606,7 +750,7 @@ onMounted(loadConfig);
           </div>
         </div>
 
-        <div class="progress-strip" aria-label="测试进度">
+        <div class="progress-strip" aria-label="测试进度" :class="{ indeterminate: isRunning && !hasFlowTimeLimit && !hasFlowByteLimit && state.mode === 'flow' }">
           <span :style="{ width: `${metrics.progress}%` }"></span>
         </div>
 
@@ -633,12 +777,19 @@ onMounted(loadConfig);
       <aside class="panel integration-panel">
         <div class="section-title">
           <Smartphone :size="18" :stroke-width="2" />
-          <h2>APP 端点</h2>
+          <h2>运行状态</h2>
         </div>
 
         <div class="origin-box">
           <Server :size="17" :stroke-width="2" />
           <span>{{ apiOriginLabel }}</span>
+        </div>
+
+        <div class="thread-grid">
+          <div v-for="thread in threadStats" :key="thread.index" class="thread-cell" :class="thread.status">
+            <span>{{ String(thread.index + 1).padStart(2, "0") }}</span>
+            <strong>{{ formatMbps(thread.mbps) }}</strong>
+          </div>
         </div>
 
         <div class="endpoint-list">

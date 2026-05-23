@@ -30,7 +30,7 @@ GET /api/config
   "minBytes": 65536,
   "chunkBytes": 262144,
   "defaultFlowSeconds": 12,
-  "maxParallel": 8,
+  "maxParallel": 64,
   "authRequired": false,
   "edge": {}
 }
@@ -68,19 +68,20 @@ Mbps = receivedBytes * 8 / elapsedSeconds / 1_000_000
 GET /api/flow?bytes=536870912&stream=0&r=<random>
 ```
 
-APP 端发起多个并发下载流，按固定时长中止请求。推荐流程：
+APP 端发起多个并发下载流，并按时间上限、流量上限或用户手动停止来结束。推荐流程：
 
 1. 从 `/api/config` 读取 `maxParallel` 和 `maxFlowBytes`。
-2. 启动 `min(4, maxParallel)` 个并发流。
+2. 启动 `min(16, maxParallel)` 个并发流，必要时允许用户提高到 `maxParallel`。
 3. 每 500 ms 统计增量字节数，计算实时 Mbps 和峰值 Mbps。
-4. 达到目标时长后主动取消所有请求。
+4. 达到目标时长、目标流量或用户停止后主动取消所有请求。
 
 推荐参数：
 
 - 默认时长：`10-15 s`
-- 高速链路：`20-30 s`
-- 默认并发：`4`
-- 高速链路并发：`6-8`
+- 长时间打流：允许不设置时长，但应提供手动停止。
+- 默认并发：`16`
+- 高速链路并发：`32-64`
+- 流量上限：建议提供 `GiB` 输入，`0` 表示不限。
 
 ## 5. 上传测速
 
@@ -107,7 +108,7 @@ X-Speedtest-Bytes: 8388608
 
 - 每次请求带随机参数 `r`，避免浏览器、WebView 或代理复用缓存。
 - 下载和打流接口响应头已经设置 `Cache-Control: no-store, no-transform`，客户端也应使用 no-cache/no-store 策略。
-- 不要无限打流；使用固定时长并主动取消请求。
+- 长时间或不限时打流必须提供显式停止按钮，也建议提供流量上限。
 - 在 APP 后台或低电量模式下停止测速，避免系统限速导致结果失真。
 - 统计时以客户端实际收到/发送的字节数为准，不要只信任 `Content-Length`。
 - 不要把令牌放进 URL；使用 `X-Speedtest-Token` 请求头。

@@ -18,9 +18,9 @@ const DEFAULT_CONFIG = {
   maxFlowBytes: 1024 * 1024 * 1024,
   maxUploadBytes: 64 * 1024 * 1024,
   minBytes: 64 * 1024,
-  chunkBytes: 256 * 1024,
+  chunkBytes: 1024 * 1024,
   defaultFlowSeconds: 12,
-  maxParallel: 8,
+  maxParallel: 64,
   uploadReadTimeoutMs: 30 * 1000,
   staticMaxAge: 31536000
 };
