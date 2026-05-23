@@ -1,0 +1,39 @@
+{
+  "name": "speedtest-esa",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Single-file Alibaba Cloud ESA edge speed test server with Vue UI, app APIs, streaming download, flow testing, upload testing, and build-time token protection.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yuan-666/speedtest-esa.git"
+  },
+  "keywords": [
+    "aliyun-esa",
+    "edge-function",
+    "edgeroutine",
+    "speedtest",
+    "network-testing",
+    "vue3",
+    "vite",
+    "app-api"
+  ],
+  "type": "module",
+  "scripts": {
+    "dev": "node tools/dev.mjs",
+    "dev:api": "node tools/local-edge.mjs",
+    "dev:web": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "build:edge": "npm run build && node tools/inline-static.mjs",
+    "preview": "vite preview --host 127.0.0.1",
+    "scan:privacy": "node tools/privacy-scan.mjs",
+    "test:smoke": "node tools/smoke-test.mjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-vue": "^5.2.4",
+    "lucide-vue-next": "^0.511.0",
+    "vite": "^6.3.5",
+    "vue": "^3.5.14"
+  },
+  "devDependencies": {}
+}
