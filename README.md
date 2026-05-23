@@ -98,6 +98,19 @@ Upload `dist-edge/edge.js` to ESA Functions / EdgeRoutine and bind the target ro
 
 Important: `dist-edge/edge.js` may contain build-time access tokens. It is a deploy artifact only. Do not commit it to a public repository. This repo ignores `dist/` and `dist-edge/`.
 
+For ESA GitHub-connected builds, use:
+
+| Field | Value |
+| --- | --- |
+| Install command | `npm install` |
+| Build command | `npm run build:edge` |
+| Root directory | `/` |
+| Static resource directory | `/dist` |
+| Function file path | `/dist-edge/edge.js` |
+| Node.js version | `22.x` |
+
+Do not set the function file path to `/edge/speedtest-edge.js` for production builds. That source file is valid code, but it does not contain build-time injected tokens. The generated `/dist-edge/edge.js` file contains the ESA module entry and the build-time token config.
+
 ## Token Format
 
 ESA functions cannot read runtime environment variables in this deployment model, so access tokens are injected at build time by `tools/inline-static.mjs`.

@@ -42,6 +42,14 @@ if (typeof globalThis !== "undefined") {
   globalThis.speedtestEdge = { handleRequest, CONFIG };
 }
 
+const esaEntrypoint = {
+  fetch(request) {
+    return handleRequest(request);
+  }
+};
+
+export default esaEntrypoint;
+
 async function handleRequest(request) {
   const url = new URL(request.url);
 
